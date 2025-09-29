@@ -1,0 +1,961 @@
+import React, { useState, useRef, useCallback, useEffect } from 'react';
+import { Canvas, useFrame, useLoader, useThree } from '@react-three/fiber';
+import { OrbitControls, Center, Text } from '@react-three/drei';
+import { OBJLoader } from 'three/examples/jsm/loaders/OBJLoader';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader';
+import * as THREE from 'three';
+import axios from 'axios';
+import { Upload, Play, Download, Settings, Sparkles } from 'lucide-react';
+import { Button } from './components/ui/button';
+import { Card, CardHeader, CardTitle, CardContent } from './components/ui/card';
+import { Slider } from './components/ui/slider';
+import { Label } from './components/ui/label';
+import { Progress } from './components/ui/progress';
+import { toast } from 'sonner';
+import './App.css';
+
+const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
+const API = `${BACKEND_URL}/api`;
+
+// Hologram shader material
+const hologramVertexShader = `
+uniform float time;
+uniform float glowIntensity;
+varying vec2 vUv;
+varying vec3 vNormal;
+varying vec3 vPosition;
+
+void main() {
+    vUv = uv;
+    vNormal = normalize(normalMatrix * normal);
+    vPosition = position;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`;
+
+const hologramFragmentShader = `
+uniform float time;
+uniform float glowIntensity;
+uniform float scanSpeed;
+uniform float flickerRate;
+varying vec2 vUv;
+varying vec3 vNormal;
+varying vec3 vPosition;
+
+void main() {
+    // Base hologram color (cyan)
+    vec3 hologramColor = vec3(0.0, 1.0, 1.0);
+    
+    // Fresnel effect for edge glow
+    vec3 viewVector = normalize(cameraPosition - vPosition);
+    float fresnel = 1.0 - max(0.0, dot(viewVector, vNormal));
+    fresnel = pow(fresnel, 2.0);
+    
+    // Scanning lines effect
+    float scanLine = sin((vPosition.y + time * scanSpeed) * 10.0) * 0.5 + 0.5;
+    scanLine = smoothstep(0.3, 0.7, scanLine);
+    
+    // Flicker effect
+    float flicker = sin(time * flickerRate) * 0.1 + 0.9;
+    
+    // Combine effects - INCREASED VISIBILITY
+    float alpha = (0.8 + fresnel * 0.3 + scanLine * 0.3) * glowIntensity * flicker;
+    alpha = clamp(alpha, 0.7, 1.0);
+    
+    // Add some noise for more realistic hologram effect
+    float noise = fract(sin(dot(vUv, vec2(12.9898, 78.233))) * 43758.5453);
+    alpha += noise * 0.05;
+    
+    gl_FragColor = vec4(hologramColor, alpha);
+}
+`;
+
+// WebGL Detection Component
+function WebGLChecker({ children }) {
+    const [webglSupported, setWebglSupported] = useState(true);
+    const [webglError, setWebglError] = useState(null);
+
+    React.useEffect(() => {
+        try {
+            const canvas = document.createElement('canvas');
+            const context = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+            if (!context) {
+                setWebglSupported(false);
+                setWebglError('WebGL is not supported in this browser');
+            }
+        } catch (error) {
+            setWebglSupported(false);
+            setWebglError(`WebGL error: ${error.message}`);
+        }
+    }, []);
+
+    if (!webglSupported) {
+        return (
+            <div className="h-full flex items-center justify-center">
+                <div className="text-center space-y-4">
+                    <div className="w-16 h-16 mx-auto bg-red-500/20 rounded-full flex items-center justify-center">
+                        <span className="text-2xl">⚠️</span>
+                    </div>
+                    <div>
+                        <h3 className="text-xl font-semibold text-red-400 mb-2">
+                            WebGL Not Available
+                        </h3>
+                        <p className="text-gray-400 text-sm">
+                            {webglError || 'Your browser does not support WebGL'}
+                        </p>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    return children;
+}
+
+// Enhanced 3D Model Loader Component with Detailed Logging
+function ModelLoader({ modelUrl, settings }) {
+    const [modelGeometry, setModelGeometry] = useState(null);
+    const [modelMaterial, setModelMaterial] = useState(null);
+    const [loadingState, setLoadingState] = useState('loading');
+    const [loadingError, setLoadingError] = useState(null);
+    const meshRef = useRef();
+    
+    // Animation
+    useFrame(() => {
+        if (meshRef.current) {
+            meshRef.current.rotation.y += 0.01;
+        }
+    });
+
+    useEffect(() => {
+        if (!modelUrl) return;
+        
+        console.log('🚀 ModelLoader: Starting to load model from URL:', modelUrl);
+        setLoadingState('loading');
+        setLoadingError(null);
+        
+        // Determine file type from URL
+        const urlLower = modelUrl.toLowerCase();
+        let loader = null;
+        let fileType = '';
+        
+        if (urlLower.includes('.obj')) {
+            loader = new OBJLoader();
+            fileType = 'OBJ';
+            console.log('📄 ModelLoader: Using OBJLoader for OBJ file');
+        } else if (urlLower.includes('.gltf') || urlLower.includes('.glb')) {
+            loader = new GLTFLoader();
+            fileType = 'GLTF/GLB';
+            console.log('📄 ModelLoader: Using GLTFLoader for GLTF/GLB file');
+        } else {
+            console.error('❌ ModelLoader: Unsupported file type from URL:', modelUrl);
+            setLoadingError('Unsupported file type');
+            setLoadingState('error');
+            return;
+        }
+        
+        console.log(`🔄 ModelLoader: Loading ${fileType} file...`);
+        
+        loader.load(
+            modelUrl,
+            // Success callback
+            (result) => {
+                console.log(`✅ ModelLoader: ${fileType} loaded successfully!`, result);
+                
+                let mesh = null;
+                
+                if (fileType === 'OBJ') {
+                    // OBJ files return a Group
+                    console.log('🔍 ModelLoader: Processing OBJ Group...');
+                    console.log('  └─ Children count:', result.children.length);
+                    
+                    if (result.children.length > 0) {
+                        // Get the first mesh from the group
+                        mesh = result.children.find(child => child.isMesh);
+                        if (mesh) {
+                            console.log('✅ ModelLoader: Found mesh in OBJ:', mesh);
+                            console.log('  └─ Geometry vertices:', mesh.geometry.attributes.position.count);
+                            console.log('  └─ Has normals:', !!mesh.geometry.attributes.normal);
+                            console.log('  └─ Has UVs:', !!mesh.geometry.attributes.uv);
+                        } else {
+                            console.error('❌ ModelLoader: No mesh found in OBJ children');
+                            setLoadingError('No mesh geometry found in OBJ file');
+                            setLoadingState('error');
+                            return;
+                        }
+                    }
+                } else if (fileType === 'GLTF/GLB') {
+                    // GLTF files have a scene
+                    console.log('🔍 ModelLoader: Processing GLTF scene...');
+                    const scene = result.scene;
+                    if (scene) {
+                        mesh = scene.children.find(child => child.isMesh) || scene;
+                        console.log('✅ ModelLoader: Found GLTF mesh:', mesh);
+                    }
+                }
+                
+                if (mesh && mesh.geometry) {
+                    console.log('🎯 ModelLoader: Extracting geometry and material...');
+                    
+                    // Store geometry
+                    setModelGeometry(mesh.geometry);
+                    
+                    // Create hologram material
+                    const hologramMaterial = new THREE.ShaderMaterial({
+                        uniforms: {
+                            time: { value: 0 },
+                            glowIntensity: { value: settings.glowIntensity || 0.8 },
+                            scanSpeed: { value: settings.scanSpeed || 1.0 },
+                            flickerRate: { value: settings.flickerRate || 2.0 }
+                        },
+                        vertexShader: hologramVertexShader,
+                        fragmentShader: hologramFragmentShader,
+                        transparent: true,
+                        side: THREE.DoubleSide
+                    });
+                    
+                    setModelMaterial(hologramMaterial);
+                    setLoadingState('loaded');
+                    
+                    console.log('🎉 ModelLoader: Model loaded and material created successfully!');
+                } else {
+                    console.error('❌ ModelLoader: No valid geometry found in loaded model');
+                    setLoadingError('No geometry found in model');
+                    setLoadingState('error');
+                }
+            },
+            // Progress callback
+            (progress) => {
+                const percent = (progress.loaded / progress.total) * 100;
+                console.log(`📊 ModelLoader: Loading progress: ${percent.toFixed(1)}%`);
+            },
+            // Error callback
+            (error) => {
+                console.error('❌ ModelLoader: Failed to load model:', error);
+                setLoadingError(`Failed to load model: ${error.message || error}`);
+                setLoadingState('error');
+            }
+        );
+        
+        // Cleanup function
+        return () => {
+            console.log('🧹 ModelLoader: Cleaning up model loader');
+            if (modelGeometry) {
+                modelGeometry.dispose();
+            }
+            if (modelMaterial) {
+                modelMaterial.dispose();
+            }
+        };
+    }, [modelUrl, settings.glowIntensity, settings.scanSpeed, settings.flickerRate]);
+
+    // Update shader uniforms when settings change
+    useFrame((state) => {
+        if (modelMaterial && modelMaterial.uniforms) {
+            modelMaterial.uniforms.time.value = state.clock.elapsedTime;
+            modelMaterial.uniforms.glowIntensity.value = settings.glowIntensity || 0.8;
+            modelMaterial.uniforms.scanSpeed.value = settings.scanSpeed || 1.0;
+            modelMaterial.uniforms.flickerRate.value = settings.flickerRate || 2.0;
+        }
+    });
+
+    if (loadingState === 'loading') {
+        return (
+            <Center>
+                <Text 
+                    color="cyan" 
+                    fontSize={1}
+                    position={[0, 0, 0]}
+                >
+                    Loading 3D Model...
+                </Text>
+            </Center>
+        );
+    }
+
+    if (loadingState === 'error') {
+        return (
+            <Center>
+                <Text 
+                    color="red" 
+                    fontSize={0.8}
+                    position={[0, 0, 0]}
+                >
+                    Error: {loadingError}
+                </Text>
+            </Center>
+        );
+    }
+
+    if (modelGeometry && modelMaterial) {
+        return (
+            <Center>
+                <mesh 
+                    ref={meshRef} 
+                    geometry={modelGeometry} 
+                    material={modelMaterial}
+                    scale={[2, 2, 2]}
+                />
+            </Center>
+        );
+    }
+
+    return null;
+}
+
+// Basic THREE.js Integration - Bypass React Three Fiber
+function DirectThreeViewer({ modelUrl }) {
+    const canvasRef = useRef(null);
+    const [isLoading, setIsLoading] = useState(true);
+    const [error, setError] = useState(null);
+
+    React.useEffect(() => {
+        if (!canvasRef.current) return;
+
+        console.log('🚀 Initializing Direct Three.js Setup');
+        
+        // Basic Three.js setup
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x000000);
+        
+        const camera = new THREE.PerspectiveCamera(75, canvasRef.current.clientWidth / canvasRef.current.clientHeight, 0.1, 1000);
+        camera.position.set(0, 0, 5);
+        
+        const renderer = new THREE.WebGLRenderer({ 
+            canvas: canvasRef.current,
+            antialias: true,
+            alpha: true
+        });
+        renderer.setSize(canvasRef.current.clientWidth, canvasRef.current.clientHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        
+        // Add lights
+        const ambientLight = new THREE.AmbientLight(0x404040, 0.6);
+        scene.add(ambientLight);
+        
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+        directionalLight.position.set(5, 5, 5);
+        scene.add(directionalLight);
+
+        // Add a test cube first to verify rendering works
+        const testGeometry = new THREE.BoxGeometry(1, 1, 1);
+        const testMaterial = new THREE.MeshPhongMaterial({ 
+            color: 0x00ffff,
+            emissive: 0x002222
+        });
+        const testCube = new THREE.Mesh(testGeometry, testMaterial);
+        scene.add(testCube);
+        
+        console.log('🚀 Test cube added to scene');
+        
+        // Animation loop
+        function animate() {
+            requestAnimationFrame(animate);
+            testCube.rotation.x += 0.01;
+            testCube.rotation.y += 0.01;
+            renderer.render(scene, camera);
+        }
+        
+        animate();
+        setIsLoading(false);
+        
+        console.log('🚀 Direct Three.js rendering started');
+        
+        // Cleanup
+        return () => {
+            if (renderer) {
+                renderer.dispose();
+            }
+        };
+    }, [modelUrl]);
+
+    if (error) {
+        return (
+            <div className="h-full flex items-center justify-center text-red-400">
+                <div className="text-center">
+                    <h3 className="text-lg font-semibold mb-2">Rendering Error</h3>
+                    <p className="text-sm">{error}</p>
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <div className="w-full h-full">
+            <canvas 
+                ref={canvasRef} 
+                className="w-full h-full"
+                style={{ display: 'block' }}
+            />
+            {isLoading && (
+                <div className="absolute inset-0 flex items-center justify-center text-cyan-400">
+                    <div>Initializing 3D Renderer...</div>
+                </div>
+            )}
+        </div>
+    );
+}
+
+// Enhanced Test Geometry Component for Pipeline Validation
+function TestGeometry({ settings }) {
+    const meshRef = useRef();
+    
+    useFrame(() => {
+        if (meshRef.current) {
+            meshRef.current.rotation.y += 0.01;
+            meshRef.current.rotation.x += 0.005;
+        }
+    });
+
+    const testMaterial = new THREE.MeshPhongMaterial({ 
+        color: 0x00ffff,
+        emissive: 0x004444,
+        shininess: 30,
+        transparent: false,
+        opacity: 1.0,
+        side: THREE.DoubleSide 
+    });
+
+    console.log('🧪 Test geometry rendered');
+
+    return (
+        <Center>
+            <mesh ref={meshRef}>
+                <boxGeometry args={[2, 2, 2]} />
+                <primitive object={testMaterial} attach="material" />
+            </mesh>
+        </Center>
+    );
+}
+
+// Enhanced Canvas with Direct Three.js Fallback
+function HologramCanvas({ modelUrl, settings }) {
+    const [canvasError, setCanvasError] = useState(null);
+    const [useTestGeometry, setUseTestGeometry] = useState(false);
+    const [useDirectThree, setUseDirectThree] = useState(false); // Start with React Three Fiber to use actual model loading
+
+    const handleCanvasError = (error) => {
+        console.error('Canvas error:', error);
+        setCanvasError(error.message || 'Canvas rendering error');
+    };
+
+    if (canvasError) {
+        return (
+            <div className="h-full flex items-center justify-center">
+                <div className="text-center space-y-4">
+                    <div className="w-16 h-16 mx-auto bg-red-500/20 rounded-full flex items-center justify-center">
+                        <span className="text-2xl">⚠️</span>
+                    </div>
+                    <div>
+                        <h3 className="text-xl font-semibold text-red-400 mb-2">
+                            3D Rendering Error
+                        </h3>
+                        <p className="text-gray-400 text-sm">
+                            {canvasError}
+                        </p>
+                        <Button 
+                            onClick={() => setCanvasError(null)}
+                            className="mt-4 bg-cyan-500 hover:bg-cyan-600"
+                        >
+                            Try Again
+                        </Button>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
+    return (
+        <WebGLChecker>
+            <div className="relative w-full h-full">
+                {useDirectThree ? (
+                    <DirectThreeViewer modelUrl={modelUrl} />
+                ) : (
+                    <Canvas
+                        camera={{ position: [5, 5, 5], fov: 60 }}
+                        gl={{ 
+                            alpha: true, 
+                            antialias: true, 
+                            preserveDrawingBuffer: true,
+                            powerPreference: "high-performance"
+                        }}
+                        onCreated={(state) => {
+                            console.log('🎬 WebGL context created:', state.gl.getContext());
+                            console.log('🎬 Camera initial:', state.camera.position);
+                            state.camera.lookAt(0, 0, 0);
+                        }}
+                        onError={handleCanvasError}
+                        style={{ background: 'transparent' }}
+                    >
+                        {/* Enhanced lighting setup */}
+                        <ambientLight intensity={0.4} />
+                        <directionalLight position={[10, 10, 5]} intensity={1.0} />
+                        <directionalLight position={[-10, -10, -5]} intensity={0.5} />
+                        <pointLight position={[10, 10, 10]} intensity={0.8} />
+                        <pointLight position={[-10, -10, 10]} intensity={0.8} />
+                        <hemisphereLight skyColor={0x404040} groundColor={0x202020} intensity={0.3} />
+                        
+                        {useTestGeometry ? (
+                            <TestGeometry settings={settings} />
+                        ) : (
+                            <ModelLoader modelUrl={modelUrl} settings={settings} />
+                        )}
+                        
+                        <OrbitControls 
+                            enablePan={true}
+                            enableZoom={true}
+                            enableRotate={true}
+                            maxDistance={30}
+                            minDistance={3}
+                        />
+                    </Canvas>
+                )}
+                
+                {/* Debug Controls */}
+                <div className="absolute top-4 right-4 space-x-2">
+                    <Button
+                        onClick={() => setUseDirectThree(!useDirectThree)}
+                        className="bg-green-600 hover:bg-green-700 text-xs px-3 py-1"
+                    >
+                        {useDirectThree ? 'Use React 3 Fiber' : 'Use Direct Three.js'}
+                    </Button>
+                    {!useDirectThree && (
+                        <Button
+                            onClick={() => setUseTestGeometry(!useTestGeometry)}
+                            className="bg-purple-600 hover:bg-purple-700 text-xs px-3 py-1"
+                        >
+                            {useTestGeometry ? 'Switch to Model' : 'Switch to Test'}
+                        </Button>
+                    )}
+                </div>
+            </div>
+        </WebGLChecker>
+    );
+}
+
+// File Upload Component
+function FileUpload({ onFileSelect, isUploading }) {
+    const [isDragOver, setIsDragOver] = useState(false);
+    const fileInputRef = useRef();
+
+    const handleDragOver = useCallback((e) => {
+        e.preventDefault();
+        setIsDragOver(true);
+    }, []);
+
+    const handleDragLeave = useCallback((e) => {
+        e.preventDefault();
+        setIsDragOver(false);
+    }, []);
+
+    const handleDrop = useCallback((e) => {
+        e.preventDefault();
+        setIsDragOver(false);
+        const files = Array.from(e.dataTransfer.files);
+        if (files.length > 0) {
+            onFileSelect(files[0]);
+        }
+    }, [onFileSelect]);
+
+    const handleFileSelect = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+            onFileSelect(file);
+        }
+    };
+
+    return (
+        <div
+            className={`
+                border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all duration-300
+                ${isDragOver 
+                    ? 'border-cyan-400 bg-cyan-50/10 scale-105' 
+                    : 'border-gray-600 hover:border-cyan-500'
+                }
+                ${isUploading ? 'pointer-events-none opacity-50' : ''}
+            `}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            onClick={() => fileInputRef.current?.click()}
+        >
+            <input
+                ref={fileInputRef}
+                type="file"
+                accept=".obj,.fbx,.gltf,.glb,.ply"
+                onChange={handleFileSelect}
+                className="hidden"
+            />
+            
+            <div className="space-y-4">
+                <div className="mx-auto w-16 h-16 bg-gradient-to-br from-cyan-400 to-blue-500 rounded-full flex items-center justify-center">
+                    <Upload className="w-8 h-8 text-white" />
+                </div>
+                
+                <div>
+                    <h3 className="text-xl font-semibold text-gray-200 mb-2">
+                        Upload 3D Model
+                    </h3>
+                    <p className="text-gray-400 mb-4">
+                        Drag & drop your 3D file or click to browse
+                    </p>
+                    <p className="text-sm text-gray-500">
+                        Supports: OBJ, FBX, GLTF, GLB, PLY (Max 50MB)
+                    </p>
+                </div>
+                
+                {isUploading && (
+                    <div className="animate-pulse text-cyan-400">
+                        <Sparkles className="w-6 h-6 mx-auto mb-2" />
+                        <p>Processing your model...</p>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+}
+
+// Controls Panel Component with Real-time Updates
+function ControlsPanel({ settings, onSettingsChange }) {
+    const handleGlowChange = (value) => {
+        console.log('Glow intensity changed to:', value[0]);
+        onSettingsChange({ ...settings, glowIntensity: value[0] });
+    };
+
+    const handleScanSpeedChange = (value) => {
+        console.log('Scan speed changed to:', value[0]);
+        onSettingsChange({ ...settings, scanSpeed: value[0] });
+    };
+
+    const handleFlickerChange = (value) => {
+        console.log('Flicker rate changed to:', value[0]);
+        onSettingsChange({ ...settings, flickerRate: value[0] });
+    };
+
+    return (
+        <Card className="bg-gray-900/80 border-gray-700">
+            <CardHeader>
+                <CardTitle className="text-cyan-400 flex items-center gap-2">
+                    <Settings className="w-5 h-5" />
+                    Hologram Controls
+                </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-6">
+                <div>
+                    <Label className="text-gray-300 mb-3 block">
+                        Glow Intensity: {settings.glowIntensity.toFixed(1)}
+                    </Label>
+                    <Slider
+                        value={[settings.glowIntensity]}
+                        onValueChange={handleGlowChange}
+                        min={0.1}
+                        max={2.0}
+                        step={0.1}
+                        className="w-full"
+                    />
+                </div>
+                
+                <div>
+                    <Label className="text-gray-300 mb-3 block">
+                        Scan Speed: {settings.scanSpeed.toFixed(1)}
+                    </Label>
+                    <Slider
+                        value={[settings.scanSpeed]}
+                        onValueChange={handleScanSpeedChange}
+                        min={0.1}
+                        max={5.0}
+                        step={0.1}
+                        className="w-full"
+                    />
+                </div>
+                
+                <div>
+                    <Label className="text-gray-300 mb-3 block">
+                        Flicker Rate: {settings.flickerRate.toFixed(1)}
+                    </Label>
+                    <Slider
+                        value={[settings.flickerRate]}
+                        onValueChange={handleFlickerChange}
+                        min={0.5}
+                        max={10.0}
+                        step={0.1}
+                        className="w-full"
+                    />
+                </div>
+            </CardContent>
+        </Card>
+    );
+}
+
+// Main App Component
+function App() {
+    const [selectedFile, setSelectedFile] = useState(null);
+    const [modelUrl, setModelUrl] = useState(null); // Start with no model loaded
+    const [currentModelId, setCurrentModelId] = useState(null);
+    const [isUploading, setIsUploading] = useState(false);
+    const [uploadProgress, setUploadProgress] = useState(0);
+    const [isGeneratingVideo, setIsGeneratingVideo] = useState(false);
+    const [videoJobId, setVideoJobId] = useState(null);
+    const [videoProgress, setVideoProgress] = useState(0);
+    const [settings, setSettings] = useState({
+        glowIntensity: 0.8,
+        scanSpeed: 1.0,
+        flickerRate: 2.0
+    });
+
+    const handleFileSelect = async (file) => {
+        setIsUploading(true);
+        setUploadProgress(0);
+        
+        try {
+            const formData = new FormData();
+            formData.append('file', file);
+
+            console.log('Uploading file:', file.name);
+
+            const response = await axios.post(`${API}/upload-model`, formData, {
+                headers: {
+                    'Content-Type': 'multipart/form-data'
+                },
+                onUploadProgress: (progressEvent) => {
+                    const progress = Math.round((progressEvent.loaded * 100) / progressEvent.total);
+                    setUploadProgress(progress);
+                }
+            });
+
+            console.log('Upload response:', response.data);
+
+            setSelectedFile(file);
+            setCurrentModelId(response.data.id);
+            const fileUrl = `${BACKEND_URL}/api/${response.data.file_path}`;
+            console.log('Model URL:', fileUrl);
+            setModelUrl(fileUrl);
+            toast.success('Model uploaded successfully!');
+            
+        } catch (error) {
+            console.error('Error uploading file:', error);
+            toast.error(error.response?.data?.detail || 'Failed to upload file');
+        } finally {
+            setIsUploading(false);
+        }
+    };
+
+    const handleGenerateVideo = async () => {
+        if (!currentModelId) {
+            toast.error('Please upload a 3D model first');
+            return;
+        }
+
+        setIsGeneratingVideo(true);
+        setVideoProgress(0);
+        
+        try {
+            console.log('🎬 Starting video generation for model:', currentModelId);
+            
+            const response = await axios.post(`${API}/generate-video`, {
+                model_id: currentModelId,
+                settings: settings
+            });
+
+            const jobId = response.data.id;
+            setVideoJobId(jobId);
+            
+            console.log('✅ Video generation started, job ID:', jobId);
+            toast.success('Video generation started!');
+            
+            // Poll for progress
+            pollVideoProgress(jobId);
+            
+        } catch (error) {
+            console.error('❌ Error generating video:', error);
+            toast.error(error.response?.data?.detail || 'Failed to start video generation');
+            setIsGeneratingVideo(false);
+        }
+    };
+
+    const pollVideoProgress = async (jobId) => {
+        try {
+            const response = await axios.get(`${API}/video-job/${jobId}`);
+            const job = response.data;
+            
+            console.log('📊 Video job status:', job.status, 'Progress:', job.progress);
+            setVideoProgress(job.progress);
+            
+            if (job.status === 'completed') {
+                setIsGeneratingVideo(false);
+                toast.success('Hologram video generated successfully!');
+                console.log('🎉 Video generation completed!');
+            } else if (job.status === 'failed') {
+                setIsGeneratingVideo(false);
+                toast.error(`Video generation failed: ${job.error_message}`);
+                console.error('❌ Video generation failed:', job.error_message);
+            } else if (job.status === 'processing' || job.status === 'pending') {
+                // Continue polling
+                setTimeout(() => pollVideoProgress(jobId), 2000);
+            }
+        } catch (error) {
+            console.error('Error polling video progress:', error);
+            setIsGeneratingVideo(false);
+            toast.error('Failed to check video generation progress');
+        }
+    };
+
+    const handleDownloadVideo = async () => {
+        if (!videoJobId) {
+            toast.error('No video available for download');
+            return;
+        }
+
+        try {
+            console.log('📥 Downloading video for job:', videoJobId);
+            
+            const response = await axios.get(`${API}/download-video/${videoJobId}`, {
+                responseType: 'blob'
+            });
+            
+            // Create download link
+            const url = window.URL.createObjectURL(new Blob([response.data]));
+            const link = document.createElement('a');
+            link.href = url;
+            link.setAttribute('download', `hologram_video_${videoJobId}.mp4`);
+            document.body.appendChild(link);
+            link.click();
+            link.remove();
+            window.URL.revokeObjectURL(url);
+            
+            toast.success('Video download started!');
+            
+        } catch (error) {
+            console.error('❌ Error downloading video:', error);
+            toast.error(error.response?.data?.detail || 'Failed to download video');
+        }
+    };
+
+    return (
+        <div className="min-h-screen bg-gradient-to-br from-gray-900 via-gray-800 to-black text-white">
+            {/* Header */}
+            <header className="border-b border-gray-700 bg-black/20 backdrop-blur-sm">
+                <div className="container mx-auto px-6 py-4">
+                    <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                            <div className="w-10 h-10 bg-gradient-to-br from-cyan-400 to-blue-500 rounded-lg flex items-center justify-center">
+                                <Sparkles className="w-6 h-6 text-white" />
+                            </div>
+                            <div>
+                                <h1 className="text-2xl font-bold bg-gradient-to-r from-cyan-400 to-blue-400 bg-clip-text text-transparent">
+                                    HoloForge
+                                </h1>
+                                <p className="text-sm text-gray-400">3D to Hologram Converter</p>
+                            </div>
+                        </div>
+                        
+                        {modelUrl && (
+                            <div className="flex gap-3">
+                                <Button 
+                                    variant="outline" 
+                                    className="border-cyan-500 text-cyan-400 hover:bg-cyan-500/10"
+                                    onClick={handleGenerateVideo}
+                                    disabled={isGeneratingVideo}
+                                >
+                                    <Play className="w-4 h-4 mr-2" />
+                                    {isGeneratingVideo ? `Generating... ${videoProgress}%` : 'Generate Video'}
+                                </Button>
+                                <Button 
+                                    className="bg-gradient-to-r from-cyan-500 to-blue-500 hover:from-cyan-600 hover:to-blue-600"
+                                    onClick={handleDownloadVideo}
+                                    disabled={!videoJobId || isGeneratingVideo}
+                                >
+                                    <Download className="w-4 h-4 mr-2" />
+                                    Download
+                                </Button>
+                            </div>
+                        )}
+                    </div>
+                </div>
+            </header>
+
+            <main className="container mx-auto px-6 py-8">
+                <div className="grid lg:grid-cols-12 gap-8">
+                    {/* Upload Area */}
+                    <div className="lg:col-span-3">
+                        <div className="space-y-6">
+                            <FileUpload 
+                                onFileSelect={handleFileSelect} 
+                                isUploading={isUploading}
+                            />
+                            
+                            {isUploading && (
+                                <Card className="bg-gray-900/80 border-gray-700">
+                                    <CardContent className="pt-6">
+                                        <div className="space-y-3">
+                                            <div className="flex justify-between text-sm">
+                                                <span className="text-gray-400">Uploading...</span>
+                                                <span className="text-cyan-400">{uploadProgress}%</span>
+                                            </div>
+                                            <Progress value={uploadProgress} className="w-full" />
+                                        </div>
+                                    </CardContent>
+                                </Card>
+                            )}
+                            
+                            {isGeneratingVideo && (
+                                <Card className="bg-gray-900/80 border-gray-700">
+                                    <CardContent className="pt-6">
+                                        <div className="space-y-3">
+                                            <div className="flex justify-between text-sm">
+                                                <span className="text-gray-400">Generating Hologram Video...</span>
+                                                <span className="text-cyan-400">{videoProgress}%</span>
+                                            </div>
+                                            <Progress value={videoProgress} className="w-full" />
+                                            <p className="text-xs text-gray-500">
+                                                Creating hologram effects and rendering video frames
+                                            </p>
+                                        </div>
+                                    </CardContent>
+                                </Card>
+                            )}
+                            
+                            {modelUrl && (
+                                <ControlsPanel 
+                                    settings={settings} 
+                                    onSettingsChange={setSettings}
+                                />
+                            )}
+                        </div>
+                    </div>
+
+                    {/* 3D Viewer */}
+                    <div className="lg:col-span-9">
+                        <Card className="bg-gray-900/50 border-gray-700 h-[600px]">
+                            <CardContent className="p-0 h-full">
+                                {modelUrl ? (
+                                    <div className="w-full h-full bg-black rounded-lg overflow-hidden">
+                                        <HologramCanvas modelUrl={modelUrl} settings={settings} />
+                                    </div>
+                                ) : (
+                                    <div className="h-full flex items-center justify-center">
+                                        <div className="text-center space-y-4">
+                                            <div className="w-24 h-24 mx-auto bg-gradient-to-br from-cyan-400/20 to-blue-500/20 rounded-full flex items-center justify-center">
+                                                <Sparkles className="w-12 h-12 text-cyan-400/50" />
+                                            </div>
+                                            <div>
+                                                <h3 className="text-xl font-semibold text-gray-300 mb-2">
+                                                    Upload a 3D Model
+                                                </h3>
+                                                <p className="text-gray-500">
+                                                    Transform your 3D models into stunning hologram videos
+                                                </p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                            </CardContent>
+                        </Card>
+                    </div>
+                </div>
+            </main>
+        </div>
+    );
+}
+
+export default App;
